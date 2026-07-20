@@ -12,9 +12,67 @@ const { readFileSync } = require('fs');
 // Initialize Google API client
 const searchconsole = google.webmasters('v3');
 
-// OAuth2 client setup
-let oauth2Client;
+// Scopes required to read Search Console data.
+const GSC_SCOPES = ['https://www.googleapis.com/auth/webmasters.readonly'];
+
+// Optional manual OAuth2 access token (fallback / testing only).
 let accessToken;
+
+// Lazily-built service-account auth client (preferred, durable auth).
+let serviceAccountAuth = null;
+
+/**
+ * Build (once) and return a Google auth client from the service account JSON
+ * stored in the GOOGLE_SERVICE_ACCOUNT_JSON environment variable.
+ * Returns null if the env var is not set or cannot be parsed.
+ */
+function getServiceAccountAuth() {
+  if (serviceAccountAuth) return serviceAccountAuth;
+
+  const raw = process.env.GOOGLE_SERVICE_ACCOUNT_JSON;
+  if (!raw) return null;
+
+  let credentials;
+  try {
+    credentials = JSON.parse(raw);
+  } catch (e) {
+    console.error('GOOGLE_SERVICE_ACCOUNT_JSON is not valid JSON:', e.message);
+    return null;
+  }
+
+  // Env-var storage often escapes newlines in the private key; normalize them.
+  if (credentials.private_key) {
+    credentials.private_key = credentials.private_key.replace(/\\n/g, '\n');
+  }
+
+  serviceAccountAuth = new google.auth.GoogleAuth({
+    credentials,
+    scopes: GSC_SCOPES,
+  });
+
+  return serviceAccountAuth;
+}
+
+/**
+ * Resolve the auth client to use for a request.
+ * Priority: a manually-set access token (if any) → the service account.
+ * Returns null if neither is available.
+ */
+function resolveAuth() {
+  if (accessToken) {
+    const auth = new google.auth.OAuth2();
+    auth.setCredentials({ access_token: accessToken });
+    return auth;
+  }
+  return getServiceAccountAuth();
+}
+
+const NO_AUTH_ERROR = {
+  error:
+    'No credentials available. Set GOOGLE_SERVICE_ACCOUNT_JSON (a Google ' +
+    'service-account key that has been granted access in Search Console), ' +
+    'or call set_access_token with a valid Google OAuth2 access token.',
+};
 
 // ============================================
 // Tool Definitions
@@ -62,7 +120,7 @@ const tools = [
   },
   {
     name: 'set_access_token',
-    description: 'Set the OAuth2 access token for Google Search Console API',
+    description: 'Optional: manually set an OAuth2 access token for Google Search Console API. Not needed when GOOGLE_SERVICE_ACCOUNT_JSON is configured.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -81,16 +139,12 @@ const tools = [
 // ============================================
 
 async function getSearchAnalytics(siteUrl, startDate, endDate, dimensions = ['query'], rowLimit = 25000) {
-  if (!accessToken) {
-    return {
-      error: 'Access token not set. Call set_access_token first with a valid Google OAuth2 token.'
-    };
+  const auth = resolveAuth();
+  if (!auth) {
+    return NO_AUTH_ERROR;
   }
 
   try {
-    const auth = new google.auth.OAuth2();
-    auth.setCredentials({ access_token: accessToken });
-
     const response = await searchconsole.searchanalytics.query({
       siteUrl: siteUrl,
       requestBody: {
@@ -118,16 +172,12 @@ async function getSearchAnalytics(siteUrl, startDate, endDate, dimensions = ['qu
 }
 
 async function getSites() {
-  if (!accessToken) {
-    return {
-      error: 'Access token not set. Call set_access_token first with a valid Google OAuth2 token.'
-    };
+  const auth = resolveAuth();
+  if (!auth) {
+    return NO_AUTH_ERROR;
   }
 
   try {
-    const auth = new google.auth.OAuth2();
-    auth.setCredentials({ access_token: accessToken });
-
     const response = await searchconsole.sites.list({
       auth: auth
     });
@@ -172,7 +222,7 @@ async function handleRequest(requestBody) {
         capabilities: {},
         serverInfo: {
           name: 'Google Search Console MCP Server',
-          version: '1.0.0'
+          version: '1.1.0'
         }
       };
     } else if (method === 'resources/list') {
@@ -267,7 +317,10 @@ const server = http.createServer(async (req, res) => {
     });
   } else if (req.url === '/health' && req.method === 'GET') {
     res.writeHead(200);
-    res.end(JSON.stringify({ status: 'ok' }));
+    res.end(JSON.stringify({
+      status: 'ok',
+      auth: process.env.GOOGLE_SERVICE_ACCOUNT_JSON ? 'service_account' : (accessToken ? 'access_token' : 'none')
+    }));
   } else {
     res.writeHead(404);
     res.end(JSON.stringify({ error: 'Not found' }));
@@ -284,6 +337,7 @@ server.listen(PORT, () => {
   console.log(`Google Search Console MCP Server running on port ${PORT}`);
   console.log(`MCP Endpoint: http://localhost:${PORT}/mcp`);
   console.log(`Health Check: http://localhost:${PORT}/health`);
+  console.log(`Auth mode: ${process.env.GOOGLE_SERVICE_ACCOUNT_JSON ? 'service_account (GOOGLE_SERVICE_ACCOUNT_JSON detected)' : 'none set yet'}`);
 });
 
 module.exports = { handleRequest };
